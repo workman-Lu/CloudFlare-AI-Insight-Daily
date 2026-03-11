@@ -51,6 +51,11 @@ jobs:
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
 
+          # 保存原始响应用于调试
+          echo "API 响应:"
+          echo "$RESPONSE" | head -c 1000
+          echo ""
+
           # 解析并提取内容
           echo "$RESPONSE" > temp/folo_response.json
 
