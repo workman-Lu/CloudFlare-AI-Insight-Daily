@@ -30,65 +30,109 @@ jobs:
         id: date
         run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
-      - name: Fetch content from Folo
+      - name: Fetch content from multiple sources
         id: fetch
         env:
           FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
           FOLO_API: "https://api.follow.is/entries"
-          # 默认使用新闻聚合列表 ID（来自原项目 wrangler.toml）
           LIST_ID: ${{ vars.FOLO_LIST_ID || '158437828119024640' }}
         run: |
-          echo "正在从 Folo 获取内容..."
-          echo "使用列表 ID: $LIST_ID"
-
-          # 创建临时文件存储内容
+          echo "正在获取内容..."
           mkdir -p temp
 
-          # 调用 Folo API
-          RESPONSE=$(curl -s -X POST "$FOLO_API" \
-            -H "Content-Type: application/json" \
-            -H "Cookie: $FOLO_COOKIE" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
+          # 1. 尝试从 Folo 获取内容（如果有 Cookie）
+          if [ -n "$FOLO_COOKIE" ]; then
+            echo "从 Folo 获取内容..."
+            RESPONSE=$(curl -s -X POST "$FOLO_API" \
+              -H "Content-Type: application/json" \
+              -H "Cookie: $FOLO_COOKIE" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
+            echo "$RESPONSE" > temp/folo_response.json
+          fi
 
-          # 保存原始响应用于调试
-          echo "API 响应:"
-          echo "$RESPONSE" | head -c 1000
-          echo ""
+          # 2. 从 GitHub Trending 获取内容（公开 API，无需认证）
+          echo "从 GitHub Trending 获取内容..."
+          TRENDING_RESPONSE=$(curl -s "https://api.github.com/repos?q=ai+language:python&sort=stars&order=desc&per_page=10" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "User-Agent: GitHub-Actions")
+          echo "$TRENDING_RESPONSE" > temp/github_trending.json
 
-          # 解析并提取内容
-          echo "$RESPONSE" > temp/folo_response.json
+          # 3. 从 Hacker News 获取内容（公开 API）
+          echo "从 Hacker News 获取内容..."
+          HN_RESPONSE=$(curl -s "https://hacker-news.firebaseio.com/v0/topstories.json")
+          HN_IDS=$(echo "$HN_RESPONSE" | node -e 'const ids = JSON.parse(require("fs").readFileSync(0, "utf8")).slice(0, 10); console.log(ids.join(" "));')
 
-          # 提取标题和内容
+          echo "[" > temp/hackernews.json
+          first=true
+          for id in $HN_IDS; do
+            ITEM=$(curl -s "https://hacker-news.firebaseio.com/v0/item/$id.json")
+            if [ "$first" = true ]; then
+              first=false
+            else
+              echo "," >> temp/hackernews.json
+            fi
+            echo "$ITEM" >> temp/hackernews.json
+          done
+          echo "]" >> temp/hackernews.json
+
+          # 合并内容
           node -e '
             const fs = require("fs");
-            const data = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
-
-            if (!data.data || data.data.length === 0) {
-              console.log("没有获取到内容");
-              process.exit(0);
-            }
-
             let content = "";
-            const today = new Date().toISOString().split("T")[0];
 
-            data.data.slice(0, 10).forEach((entry, index) => {
-              const title = entry.entries?.title || "无标题";
-              const url = entry.entries?.url || "";
-              const author = entry.entries?.author || entry.feeds?.title || "未知来源";
-              const htmlContent = entry.entries?.content || "";
+            // GitHub Trending
+            try {
+              const gh = JSON.parse(fs.readFileSync("temp/github_trending.json", "utf8"));
+              if (gh.items && gh.items.length > 0) {
+                content += "\n## GitHub 热门 AI 项目\n\n";
+                gh.items.slice(0, 5).forEach((repo, i) => {
+                  content += `### ${i + 1}. ${repo.full_name}\n`;
+                  content += `**描述**: ${repo.description || "无描述"}\n`;
+                  content += `**Stars**: ${repo.stargazers_count} | **语言**: ${repo.language || "未知"}\n`;
+                  content += `[查看项目](https://github.com/${repo.full_name})\n\n---\n`;
+                });
+              }
+            } catch (e) {}
 
-              // 移除 HTML 标签获取纯文本
-              const textContent = htmlContent.replace(/<[^>]*>/g, "").substring(0, 500);
+            // Hacker News
+            try {
+              const hn = JSON.parse(fs.readFileSync("temp/hackernews.json", "utf8"));
+              const validHn = hn.filter(item => item && item.title);
+              if (validHn.length > 0) {
+                content += "\n## Hacker News 热门\n\n";
+                validHn.slice(0, 5).forEach((item, i) => {
+                  content += `### ${i + 1}. ${item.title}\n`;
+                  content += `**分数**: ${item.score || 0} | **评论**: ${item.descendants || 0}\n`;
+                  if (item.url) content += `[阅读原文](${item.url})\n`;
+                  content += `[HN 讨论](https://news.ycombinator.com/item?id=${item.id})\n\n---\n`;
+                });
+              }
+            } catch (e) {}
 
-              content += `\n### ${index + 1}. ${title}\n`;
-              content += `**来源**: ${author}\n\n`;
-              content += `${textContent}...\n\n`;
-              content += `[阅读原文](${url})\n\n---\n`;
-            });
+            // Folo（如果有）
+            try {
+              const folo = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
+              if (folo.data && folo.data.length > 0) {
+                content += "\n## Folo 订阅\n\n";
+                folo.data.slice(0, 5).forEach((entry, i) => {
+                  const title = entry.entries?.title || "无标题";
+                  const url = entry.entries?.url || "";
+                  const author = entry.entries?.author || entry.feeds?.title || "未知";
+                  content += `### ${i + 1}. ${title}\n`;
+                  content += `**来源**: ${author}\n`;
+                  if (url) content += `[阅读原文](${url})\n`;
+                  content += "\n---\n";
+                });
+              }
+            } catch (e) {}
 
-            fs.writeFileSync("temp/content.txt", content);
-            console.log("成功提取 " + data.data.length + " 条内容");
+            if (content.trim()) {
+              fs.writeFileSync("temp/content.txt", content);
+              console.log("成功获取内容");
+            } else {
+              console.log("没有获取到内容");
+            }
           '
 
           echo "content=$(cat temp/content.txt 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
