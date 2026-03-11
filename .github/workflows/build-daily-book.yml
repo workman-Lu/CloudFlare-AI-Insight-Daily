@@ -105,11 +105,69 @@ jobs:
             fi
           fi
           
+      - name: Send Daily to WPS IM Robot
+        if: ${{ secrets.WPS_WEBHOOK_URL != '' }}
+        run: |
+          echo "正在推送日报到 WPS 协作机器人..."
+
+          # 获取今日日期
+          TODAY_DATE=$(TZ="Asia/Shanghai" date +%Y-%m-%d)
+
+          # 尝试从 daily 目录读取今日日报
+          DAILY_FILE="daily/${TODAY_DATE}.md"
+
+          if [ -f "$DAILY_FILE" ]; then
+            echo "找到今日日报文件: $DAILY_FILE"
+
+            # 读取日报内容并转义 JSON 特殊字符
+            DAILY_CONTENT=$(cat "$DAILY_FILE" | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | head -c 3500)
+
+            # 发送到 WPS Webhook
+            HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "${{ secrets.WPS_WEBHOOK_URL }}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"msg_type\": \"text\",
+                \"content\": {
+                  \"text\": \"📰 AI洞察日报 - ${TODAY_DATE}\\n\\n${DAILY_CONTENT}\"
+                }
+              }")
+
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "✅ 日报已成功推送到 WPS 协作机器人"
+            else
+              echo "❌ 推送失败，HTTP 状态码: $HTTP_CODE"
+              cat response.txt
+            fi
+          else
+            echo "未找到今日日报文件: $DAILY_FILE"
+            echo "尝试从最新文件读取..."
+
+            # 查找最新的日报文件
+            LATEST_FILE=$(find daily -type f -name "*.md" ! -path "daily/*/*" | sort -r | head -n 1)
+
+            if [ -n "$LATEST_FILE" ] && [ -f "$LATEST_FILE" ]; then
+              echo "找到最新日报: $LATEST_FILE"
+              DAILY_CONTENT=$(cat "$LATEST_FILE" | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | head -c 3500)
+
+              curl -s -X POST "${{ secrets.WPS_WEBHOOK_URL }}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"msg_type\": \"text\",
+                  \"content\": {
+                    \"text\": \"📰 AI洞察日报\\n\\n${DAILY_CONTENT}\"
+                  }
+                }"
+              echo "✅ 已推送最新日报到 WPS 协作机器人"
+            else
+              echo "❌ 未找到任何日报文件，跳过推送"
+            fi
+          fi
+
       - name: Commit and push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
+
           git add today/ daily/
           if [ -f "rss.xml" ]; then
             git add rss.xml
