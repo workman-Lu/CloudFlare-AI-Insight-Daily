@@ -42,6 +42,7 @@ jobs:
           mkdir -p temp
 
           # 1. 从多个 Folo 订阅源获取内容（如果有 Cookie）
+          all_folo_data=""
           if [ -n "$FOLO_COOKIE" ]; then
             echo "从 Folo 获取内容..."
 
@@ -58,24 +59,40 @@ jobs:
                   -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
                   -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
 
-                # 保存每个订阅源的响应
-                if [ -f temp/folo_response.json ]; then
-                  # 合并数据
-                  node -e "
-                    const fs = require('fs');
-                    const existing = fs.existsSync('temp/folo_response.json') ? JSON.parse(fs.readFileSync('temp/folo_response.json', 'utf8')) : {data: []};
-                    const newData = JSON.parse(process.argv[2]);
-                    if (newData.data && newData.data.length > 0) {
-                      existing.data = existing.data || [];
-                      existing.data.push(...newData.data);
-                    }
-                    fs.writeFileSync('temp/folo_response.json', JSON.stringify(existing));
-                  " "$RESPONSE"
+                # 检查响应是否有效
+                if [ -n "$RESPONSE" ] && [ "$RESPONSE" != "undefined" ]; then
+                  echo "响应长度: ${#RESPONSE}"
+                  all_folo_data="$all_folo_data$RESPONSE|||"
                 else
-                  echo "$RESPONSE" > temp/folo_response.json
+                  echo "订阅源 $LIST_ID 返回空响应"
                 fi
               fi
             done
+          fi
+
+          # 合并 Folo 数据
+          if [ -n "$all_folo_data" ]; then
+            echo "$all_folo_data" | node -e '
+              const fs = require("fs");
+              let stdin = "";
+              process.stdin.on("data", chunk => stdin += chunk);
+              process.stdin.on("end", () => {
+                const allData = { data: [] };
+                const responses = stdin.split("|||").filter(r => r.trim());
+                responses.forEach(resp => {
+                  try {
+                    const json = JSON.parse(resp);
+                    if (json.data && Array.isArray(json.data)) {
+                      allData.data.push(...json.data);
+                    }
+                  } catch (e) {
+                    console.log("跳过无效 JSON 响应");
+                  }
+                });
+                fs.writeFileSync("temp/folo_response.json", JSON.stringify(allData));
+                console.log("合并了 " + allData.data.length + " 条 Folo 记录");
+              });
+            '
           fi
 
           # 2. 从 GitHub Trending 获取内容（公开 API，无需认证）
