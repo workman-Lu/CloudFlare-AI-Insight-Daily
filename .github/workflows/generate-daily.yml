@@ -35,20 +35,47 @@ jobs:
         env:
           FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
           FOLO_API: "https://api.follow.is/entries"
-          LIST_ID: ${{ vars.FOLO_LIST_ID || '41440449356332035' }}
+          # 多个订阅源ID，用逗号分隔
+          LIST_IDS: ${{ vars.FOLO_LIST_IDS || '41440449356332035,41443203209057304,41795937307751506,41461870197170196,106709235749293065' }}
         run: |
           echo "正在获取内容..."
           mkdir -p temp
 
-          # 1. 尝试从 Folo 获取内容（如果有 Cookie）
+          # 1. 从多个 Folo 订阅源获取内容（如果有 Cookie）
           if [ -n "$FOLO_COOKIE" ]; then
             echo "从 Folo 获取内容..."
-            RESPONSE=$(curl -s -X POST "$FOLO_API" \
-              -H "Content-Type: application/json" \
-              -H "Cookie: $FOLO_COOKIE" \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
-            echo "$RESPONSE" > temp/folo_response.json
+
+            # 将逗号分隔的ID转换为数组
+            IFS=',' read -ra LIST_ID_ARRAY <<< "$LIST_IDS"
+
+            for LIST_ID in "${LIST_ID_ARRAY[@]}"; do
+              LIST_ID=$(echo "$LIST_ID" | tr -d ' ')  # 去除空格
+              if [ -n "$LIST_ID" ]; then
+                echo "获取订阅源: $LIST_ID"
+                RESPONSE=$(curl -s -X POST "$FOLO_API" \
+                  -H "Content-Type: application/json" \
+                  -H "Cookie: $FOLO_COOKIE" \
+                  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                  -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
+
+                # 保存每个订阅源的响应
+                if [ -f temp/folo_response.json ]; then
+                  # 合并数据
+                  node -e "
+                    const fs = require('fs');
+                    const existing = fs.existsSync('temp/folo_response.json') ? JSON.parse(fs.readFileSync('temp/folo_response.json', 'utf8')) : {data: []};
+                    const newData = JSON.parse(process.argv[2]);
+                    if (newData.data && newData.data.length > 0) {
+                      existing.data = existing.data || [];
+                      existing.data.push(...newData.data);
+                    }
+                    fs.writeFileSync('temp/folo_response.json', JSON.stringify(existing));
+                  " "$RESPONSE"
+                else
+                  echo "$RESPONSE" > temp/folo_response.json
+                fi
+              fi
+            done
           fi
 
           # 2. 从 GitHub Trending 获取内容（公开 API，无需认证）
@@ -76,10 +103,37 @@ jobs:
           done
           echo "]" >> temp/hackernews.json
 
-          # 合并内容
+          # 合并内容并保存到文件（不输出到 GITHUB_OUTPUT）
           node -e '
             const fs = require("fs");
             let content = "";
+
+            // Folo（优先显示，如果有数据）
+            try {
+              const folo = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
+              if (folo.data && folo.data.length > 0) {
+                // 按发布时间排序，取最新的
+                const sortedData = folo.data
+                  .filter(entry => entry.entries && entry.entries.title)
+                  .sort((a, b) => new Date(b.entries.publishedAt) - new Date(a.entries.publishedAt));
+
+                content += "\n## Folo 订阅精选\n\n";
+                sortedData.slice(0, 10).forEach((entry, i) => {
+                  const title = entry.entries.title;
+                  const url = entry.entries.url || "";
+                  const author = entry.entries.author || entry.feeds?.title || "未知";
+                  const publishedAt = entry.entries.publishedAt ? new Date(entry.entries.publishedAt).toLocaleDateString("zh-CN") : "";
+                  content += `### ${i + 1}. ${title}\n`;
+                  content += `**来源**: ${author}`;
+                  if (publishedAt) content += ` | **日期**: ${publishedAt}`;
+                  content += `\n`;
+                  if (url) content += `[阅读原文](${url})\n`;
+                  content += "\n---\n";
+                });
+              }
+            } catch (e) {
+              console.log("Folo 解析错误:", e.message);
+            }
 
             // GitHub Trending
             try {
@@ -110,77 +164,119 @@ jobs:
               }
             } catch (e) {}
 
-            // Folo（如果有）
-            try {
-              const folo = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
-              if (folo.data && folo.data.length > 0) {
-                content += "\n## Folo 订阅\n\n";
-                folo.data.slice(0, 5).forEach((entry, i) => {
-                  const title = entry.entries?.title || "无标题";
-                  const url = entry.entries?.url || "";
-                  const author = entry.entries?.author || entry.feeds?.title || "未知";
-                  content += `### ${i + 1}. ${title}\n`;
-                  content += `**来源**: ${author}\n`;
-                  if (url) content += `[阅读原文](${url})\n`;
-                  content += "\n---\n";
-                });
-              }
-            } catch (e) {}
-
             if (content.trim()) {
               fs.writeFileSync("temp/content.txt", content);
               console.log("成功获取内容");
             } else {
               console.log("没有获取到内容");
+              process.exit(1);
             }
           '
 
-          echo "content=$(cat temp/content.txt 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
-
       - name: Generate summary with AI
         id: ai
-        if: steps.fetch.outputs.content != ''
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_API_URL: ${{ secrets.AI_API_URL }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
         run: |
+          # 检查内容文件是否存在
+          if [ ! -f temp/content.txt ]; then
+            echo "没有内容文件，跳过 AI 生成"
+            exit 0
+          fi
+
           echo "正在调用 AI 生成摘要..."
 
           CONTENT=$(cat temp/content.txt)
 
-          # 构建 prompt
-          PROMPT="你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
+          # 将内容写入临时文件用于 prompt
+          cat > temp/prompt.txt << 'PROMPT_EOF'
+          你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
           1. 用通俗易懂的语言总结
           2. 提炼每条资讯的核心要点
           3. 保持专业但不失趣味性
           4. 使用 Markdown 格式
+          5. 对核心关键词进行加粗处理
 
           原始内容：
-          $CONTENT"
+          PROMPT_EOF
+          echo "$CONTENT" >> temp/prompt.txt
 
           # 调用 AI API (OpenAI 兼容格式)
-          RESPONSE=$(curl -s -X POST "${AI_API_URL}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $AI_API_KEY" \
-            -d "{
-              \"model\": \"$AI_MODEL\",
-              \"messages\": [
-                {\"role\": \"system\", \"content\": \"你是一名专业的AI资讯编辑，擅长用通俗易懂的语言总结科技资讯。\"},
-                {\"role\": \"user\", \"content\": \"$PROMPT\"}
+          # 使用文件来传递 JSON 避免 shell 转义问题
+          node -e '
+            const fs = require("fs");
+            const content = fs.readFileSync("temp/content.txt", "utf8");
+            const https = require("https");
+            const http = require("http");
+
+            const url = process.env.AI_API_URL;
+            const apiKey = process.env.AI_API_KEY;
+            const model = process.env.AI_MODEL || "glm-5";
+
+            const postData = JSON.stringify({
+              model: model,
+              messages: [
+                {role: "system", content: "你是一名专业的AI资讯编辑，擅长用通俗易懂的语言总结科技资讯。"},
+                {role: "user", content: `你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
+          1. 用通俗易懂的语言总结
+          2. 提炼每条资讯的核心要点
+          3. 保持专业但不失趣味性
+          4. 使用 Markdown 格式
+          5. 对核心关键词进行加粗处理
+
+          原始内容：
+          ${content}`}
               ],
-              \"max_tokens\": 4000,
-              \"temperature\": 0.7
-            }")
+              max_tokens: 4000,
+              temperature: 0.7
+            });
 
-          # 提取 AI 回复
-          SUMMARY=$(echo "$RESPONSE" | node -e '
-            const data = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            console.log(data.choices?.[0]?.message?.content || "AI 生成失败");
-          ')
+            const urlObj = new URL(url + "/v1/chat/completions");
+            const protocol = urlObj.protocol === "https:" ? https : http;
 
-          echo "$SUMMARY" > temp/summary.txt
-          echo "summary_file=temp/summary.txt" >> $GITHUB_OUTPUT
+            const options = {
+              hostname: urlObj.hostname,
+              port: urlObj.port || (urlObj.protocol === "https:" ? 443 : 80),
+              path: urlObj.pathname + "/v1/chat/completions",
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + apiKey,
+                "Content-Length": Buffer.byteLength(postData)
+              }
+            };
+
+            const req = protocol.request(options, (res) => {
+              let data = "";
+              res.on("data", chunk => data += chunk);
+              res.on("end", () => {
+                try {
+                  const json = JSON.parse(data);
+                  const summary = json.choices?.[0]?.message?.content || "AI 生成失败";
+                  fs.writeFileSync("temp/summary.txt", summary);
+                  console.log("AI 生成完成");
+                } catch (e) {
+                  console.error("解析响应失败:", e.message);
+                  console.log("响应内容:", data);
+                  fs.writeFileSync("temp/summary.txt", "AI 生成失败");
+                }
+              });
+            });
+
+            req.on("error", (e) => {
+              console.error("请求失败:", e.message);
+              fs.writeFileSync("temp/summary.txt", "AI 请求失败");
+            });
+
+            req.write(postData);
+            req.end();
+          '
+
+          if [ -f temp/summary.txt ]; then
+            echo "summary_file=temp/summary.txt" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create daily markdown file
         if: steps.ai.outputs.summary_file != ''
