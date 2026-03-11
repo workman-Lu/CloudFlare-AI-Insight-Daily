@@ -106,8 +106,15 @@ jobs:
           fi
           
       - name: Send Daily to WPS IM Robot
-        if: ${{ secrets.WPS_WEBHOOK_URL != '' }}
+        env:
+          WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
         run: |
+          # 检查是否配置了 Webhook URL
+          if [ -z "$WPS_WEBHOOK_URL" ]; then
+            echo "⚠️ WPS_WEBHOOK_URL 未配置，跳过推送"
+            exit 0
+          fi
+
           echo "正在推送日报到 WPS 协作机器人..."
 
           # 获取今日日期
@@ -123,7 +130,7 @@ jobs:
             DAILY_CONTENT=$(cat "$DAILY_FILE" | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | head -c 3500)
 
             # 发送到 WPS Webhook
-            HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "${{ secrets.WPS_WEBHOOK_URL }}" \
+            HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "$WPS_WEBHOOK_URL" \
               -H "Content-Type: application/json" \
               -d "{
                 \"msg_type\": \"text\",
@@ -149,7 +156,7 @@ jobs:
               echo "找到最新日报: $LATEST_FILE"
               DAILY_CONTENT=$(cat "$LATEST_FILE" | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | head -c 3500)
 
-              curl -s -X POST "${{ secrets.WPS_WEBHOOK_URL }}" \
+              curl -s -X POST "$WPS_WEBHOOK_URL" \
                 -H "Content-Type: application/json" \
                 -d "{
                   \"msg_type\": \"text\",
