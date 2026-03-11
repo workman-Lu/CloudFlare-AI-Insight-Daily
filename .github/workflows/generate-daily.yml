@@ -1,0 +1,204 @@
+name: Generate Daily Report
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 北京时间 22:00
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: 'gop-book'
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Fetch content from Folo
+        id: fetch
+        env:
+          FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
+          FOLO_API: "https://api.follow.is/entries"
+          LIST_ID: ${{ vars.FOLO_LIST_ID }}
+        run: |
+          echo "正在从 Folo 获取内容..."
+
+          # 创建临时文件存储内容
+          mkdir -p temp
+
+          # 调用 Folo API
+          RESPONSE=$(curl -s -X POST "$FOLO_API" \
+            -H "Content-Type: application/json" \
+            -H "Cookie: $FOLO_COOKIE" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -d "{\"listId\":\"$LIST_ID\",\"view\":1,\"withContent\":true}")
+
+          # 解析并提取内容
+          echo "$RESPONSE" > temp/folo_response.json
+
+          # 提取标题和内容
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
+
+            if (!data.data || data.data.length === 0) {
+              console.log("没有获取到内容");
+              process.exit(0);
+            }
+
+            let content = "";
+            const today = new Date().toISOString().split("T")[0];
+
+            data.data.slice(0, 10).forEach((entry, index) => {
+              const title = entry.entries?.title || "无标题";
+              const url = entry.entries?.url || "";
+              const author = entry.entries?.author || entry.feeds?.title || "未知来源";
+              const htmlContent = entry.entries?.content || "";
+
+              // 移除 HTML 标签获取纯文本
+              const textContent = htmlContent.replace(/<[^>]*>/g, "").substring(0, 500);
+
+              content += `\n### ${index + 1}. ${title}\n`;
+              content += `**来源**: ${author}\n\n`;
+              content += `${textContent}...\n\n`;
+              content += `[阅读原文](${url})\n\n---\n`;
+            });
+
+            fs.writeFileSync("temp/content.txt", content);
+            console.log("成功提取 " + data.data.length + " 条内容");
+          '
+
+          echo "content=$(cat temp/content.txt 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+
+      - name: Generate summary with AI
+        id: ai
+        if: steps.fetch.outputs.content != ''
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_URL: ${{ secrets.AI_API_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+        run: |
+          echo "正在调用 AI 生成摘要..."
+
+          CONTENT=$(cat temp/content.txt)
+
+          # 构建 prompt
+          PROMPT="你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
+          1. 用通俗易懂的语言总结
+          2. 提炼每条资讯的核心要点
+          3. 保持专业但不失趣味性
+          4. 使用 Markdown 格式
+
+          原始内容：
+          $CONTENT"
+
+          # 调用 AI API (OpenAI 兼容格式)
+          RESPONSE=$(curl -s -X POST "${AI_API_URL}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $AI_API_KEY" \
+            -d "{
+              \"model\": \"$AI_MODEL\",
+              \"messages\": [
+                {\"role\": \"system\", \"content\": \"你是一名专业的AI资讯编辑，擅长用通俗易懂的语言总结科技资讯。\"},
+                {\"role\": \"user\", \"content\": \"$PROMPT\"}
+              ],
+              \"max_tokens\": 4000,
+              \"temperature\": 0.7
+            }")
+
+          # 提取 AI 回复
+          SUMMARY=$(echo "$RESPONSE" | node -e '
+            const data = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            console.log(data.choices?.[0]?.message?.content || "AI 生成失败");
+          ')
+
+          echo "$SUMMARY" > temp/summary.txt
+          echo "summary_file=temp/summary.txt" >> $GITHUB_OUTPUT
+
+      - name: Create daily markdown file
+        if: steps.ai.outputs.summary_file != ''
+        run: |
+          echo "正在创建日报文件..."
+
+          mkdir -p daily
+
+          DATE=${{ steps.date.outputs.date }}
+          SUMMARY=$(cat temp/summary.txt)
+
+          cat > daily/${DATE}.md << EOF
+          # AI 洞察日报 - ${DATE}
+
+          > 自动生成于 $(date "+%Y-%m-%d %H:%M:%S")
+
+          ---
+
+          ${SUMMARY}
+
+          ---
+
+          *本日报由 GitHub Actions 自动生成*
+          EOF
+
+          echo "日报文件已创建: daily/${DATE}.md"
+
+      - name: Send to WPS IM Robot
+        if: steps.ai.outputs.summary_file != '' && secrets.WPS_WEBHOOK_URL != ''
+        env:
+          WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
+        run: |
+          echo "正在推送到 WPS 协作机器人..."
+
+          DATE=${{ steps.date.outputs.date }}
+          SUMMARY=$(cat temp/summary.txt | head -c 3500)
+
+          HTTP_CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "$WPS_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"msg_type\": \"text\",
+              \"content\": {
+                \"text\": \"📰 AI洞察日报 - ${DATE}\\n\\n${SUMMARY}\"
+              }
+            }")
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ 日报已成功推送到 WPS 协作机器人"
+          else
+            echo "❌ 推送失败，HTTP 状态码: $HTTP_CODE"
+            cat response.txt
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          if [ -d "daily" ]; then
+            git add daily/
+          fi
+
+          if git diff --staged --quiet; then
+            echo "没有文件变更，无需提交。"
+          else
+            echo "检测到文件变更，正在提交..."
+            git commit -m "docs: 自动生成日报 ${{ steps.date.outputs.date }}"
+            git push
+          fi
+
+      - name: Cleanup
+        run: rm -rf temp
