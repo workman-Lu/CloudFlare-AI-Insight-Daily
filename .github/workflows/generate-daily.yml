@@ -158,10 +158,16 @@ jobs:
           echo "日报文件已创建: daily/${DATE}.md"
 
       - name: Send to WPS IM Robot
-        if: steps.ai.outputs.summary_file != '' && secrets.WPS_WEBHOOK_URL != ''
+        if: steps.ai.outputs.summary_file != ''
         env:
           WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
         run: |
+          # 检查是否配置了 Webhook
+          if [ -z "$WPS_WEBHOOK_URL" ]; then
+            echo "⚠️ WPS_WEBHOOK_URL 未配置，跳过推送"
+            exit 0
+          fi
+
           echo "正在推送到 WPS 协作机器人..."
 
           DATE=${{ steps.date.outputs.date }}
