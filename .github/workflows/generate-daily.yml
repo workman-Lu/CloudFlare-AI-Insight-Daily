@@ -35,7 +35,7 @@ jobs:
         env:
           FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
           FOLO_API: "https://api.follow.is/entries"
-          LIST_ID: ${{ vars.FOLO_LIST_ID || '158437828119024640' }}
+          LIST_ID: ${{ vars.FOLO_LIST_ID || '41440449356332035' }}
         run: |
           echo "正在获取内容..."
           mkdir -p temp
