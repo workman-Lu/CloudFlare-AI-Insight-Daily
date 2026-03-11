@@ -296,13 +296,21 @@ jobs:
           fi
 
       - name: Create daily markdown file
+        id: create_file
         if: steps.ai.outputs.summary_file != ''
         run: |
+          DATE=${{ steps.date.outputs.date }}
+
+          # 检查今日日报是否已存在
+          if [ -f "daily/${DATE}.md" ]; then
+            echo "⚠️ 今日日报已存在: daily/${DATE}.md，跳过生成"
+            echo "file_exists=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "正在创建日报文件..."
 
           mkdir -p daily
-
-          DATE=${{ steps.date.outputs.date }}
           SUMMARY=$(cat temp/summary.txt)
 
           cat > daily/${DATE}.md << EOF
@@ -320,15 +328,23 @@ jobs:
           EOF
 
           echo "日报文件已创建: daily/${DATE}.md"
+          echo "file_exists=false" >> $GITHUB_OUTPUT
 
       - name: Send to WPS IM Robot
         if: steps.ai.outputs.summary_file != ''
         env:
           WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
+          FORCE_PUSH: ${{ vars.FORCE_PUSH_DAILY || 'false' }}
         run: |
           # 检查是否配置了 Webhook
           if [ -z "$WPS_WEBHOOK_URL" ]; then
             echo "⚠️ WPS_WEBHOOK_URL 未配置，跳过推送"
+            exit 0
+          fi
+
+          # 如果日报已存在且未开启强制推送，则跳过
+          if [ "${{ steps.create_file.outputs.file_exists }}" = "true" ] && [ "$FORCE_PUSH" != "true" ]; then
+            echo "⚠️ 今日日报已存在且未开启强制推送，跳过推送"
             exit 0
           fi
 
@@ -345,9 +361,9 @@ jobs:
             const summary = fs.readFileSync("temp/summary.txt", "utf8").slice(0, 3500);
 
             const postData = JSON.stringify({
-              msg_type: "text",
-              content: {
-                text: `📰 AI洞察日报 - ${date}\n\n${summary}`
+              msgtype: "text",
+              text: {
+                content: `📰 AI洞察日报 - ${date}\n\n${summary}`
               }
             });
 
