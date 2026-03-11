@@ -35,9 +35,11 @@ jobs:
         env:
           FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
           FOLO_API: "https://api.follow.is/entries"
-          LIST_ID: ${{ vars.FOLO_LIST_ID }}
+          # 默认使用新闻聚合列表 ID（来自原项目 wrangler.toml）
+          LIST_ID: ${{ vars.FOLO_LIST_ID || '158437828119024640' }}
         run: |
           echo "正在从 Folo 获取内容..."
+          echo "使用列表 ID: $LIST_ID"
 
           # 创建临时文件存储内容
           mkdir -p temp
