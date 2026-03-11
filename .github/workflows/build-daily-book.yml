@@ -175,11 +175,17 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          git add today/ daily/
+          # 检查目录是否存在再添加
+          if [ -d "today" ]; then
+            git add today/
+          fi
+
+          if [ -d "daily" ]; then
+            git add daily/
+          fi
+
           if [ -f "rss.xml" ]; then
             git add rss.xml
-          else
-            echo "rss.xml 未找到，不添加到提交中。"
           fi
 
           if git diff --staged --quiet; then
