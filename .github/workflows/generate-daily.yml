@@ -30,8 +30,20 @@ jobs:
         id: date
         run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
+      - name: Check if daily report already exists
+        id: check_exists
+        run: |
+          DATE=${{ steps.date.outputs.date }}
+          if [ -f "daily/${DATE}.md" ]; then
+            echo "⚠️ 今日日报已存在: daily/${DATE}.md"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Fetch content from multiple sources
         id: fetch
+        if: steps.check_exists.outputs.exists != 'true'
         env:
           FOLO_COOKIE: ${{ secrets.FOLO_COOKIE }}
           FOLO_API: "https://api.follow.is/entries"
@@ -192,6 +204,7 @@ jobs:
 
       - name: Generate summary with AI
         id: ai
+        if: steps.check_exists.outputs.exists != 'true'
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_API_URL: ${{ secrets.AI_API_URL }}
@@ -296,21 +309,12 @@ jobs:
           fi
 
       - name: Create daily markdown file
-        id: create_file
         if: steps.ai.outputs.summary_file != ''
         run: |
-          DATE=${{ steps.date.outputs.date }}
-
-          # 检查今日日报是否已存在
-          if [ -f "daily/${DATE}.md" ]; then
-            echo "⚠️ 今日日报已存在: daily/${DATE}.md，跳过生成"
-            echo "file_exists=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
           echo "正在创建日报文件..."
 
           mkdir -p daily
+          DATE=${{ steps.date.outputs.date }}
           SUMMARY=$(cat temp/summary.txt)
 
           cat > daily/${DATE}.md << EOF
@@ -328,13 +332,10 @@ jobs:
           EOF
 
           echo "日报文件已创建: daily/${DATE}.md"
-          echo "file_exists=false" >> $GITHUB_OUTPUT
 
       - name: Send to WPS IM Robot
-        if: steps.ai.outputs.summary_file != ''
         env:
           WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
-          FORCE_PUSH: ${{ vars.FORCE_PUSH_DAILY || 'false' }}
         run: |
           # 检查是否配置了 Webhook
           if [ -z "$WPS_WEBHOOK_URL" ]; then
@@ -342,28 +343,42 @@ jobs:
             exit 0
           fi
 
-          # 如果日报已存在且未开启强制推送，则跳过
-          if [ "${{ steps.create_file.outputs.file_exists }}" = "true" ] && [ "$FORCE_PUSH" != "true" ]; then
-            echo "⚠️ 今日日报已存在且未开启强制推送，跳过推送"
+          DATE=${{ steps.date.outputs.date }}
+          DAILY_FILE="daily/${DATE}.md"
+
+          # 检查日报文件是否存在（新创建的或已存在的）
+          if [ ! -f "$DAILY_FILE" ]; then
+            echo "⚠️ 今日日报不存在，跳过推送"
             exit 0
           fi
 
           echo "正在推送到 WPS 协作机器人..."
 
           # 使用 Node.js 发送请求，正确处理 JSON 编码
-          DATE=${{ steps.date.outputs.date }} node -e '
+          DATE=$DATE node -e '
             const https = require("https");
             const http = require("http");
             const fs = require("fs");
 
             const webhookUrl = process.env.WPS_WEBHOOK_URL;
             const date = process.env.DATE;
-            const summary = fs.readFileSync("temp/summary.txt", "utf8").slice(0, 3500);
+            const dailyFile = `daily/${date}.md`;
+
+            // 从日报文件读取内容
+            let content = "";
+            try {
+              content = fs.readFileSync(dailyFile, "utf8");
+              // 截取前3500字符
+              content = content.slice(0, 3500);
+            } catch (e) {
+              console.error("读取日报文件失败:", e.message);
+              process.exit(1);
+            }
 
             const postData = JSON.stringify({
               msgtype: "text",
               text: {
-                content: `📰 AI洞察日报 - ${date}\n\n${summary}`
+                content: `📰 AI洞察日报 - ${date}\n\n${content}`
               }
             });
 
