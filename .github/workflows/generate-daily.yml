@@ -449,9 +449,12 @@ ${content}`}
             }
 
             const postData = JSON.stringify({
-              msgtype: "markdown",
-              markdown: {
-                content: `## 📰 AI洞察周报 (${weekStart} 至 ${weekEnd})\n\n${content}`
+              type: "text",
+              content: {
+                text: {
+                  content: `📰 AI洞察周报 (${weekStart} 至 ${weekEnd})\n\n${content}`,
+                  type: "text"
+                }
               }
             });
 
