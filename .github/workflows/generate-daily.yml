@@ -1,8 +1,8 @@
-name: Generate Daily Report
+name: Generate Weekly AI Report
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 北京时间 8:00
+    - cron: '0 0 * * 5'  # 每周五北京时间 8:00
   workflow_dispatch:
 
 jobs:
@@ -26,16 +26,28 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Get current date
+      - name: Get current date range
         id: date
-        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+        run: |
+          # 获取本周的日期范围（周一到周日）
+          WEEK_START=$(date -d "last monday" +%Y-%m-%d 2>/dev/null || date -v-monday +%Y-%m-%d)
+          WEEK_END=$(date +%Y-%m-%d)
+          # 如果今天是周一，则本周开始日期就是今天
+          if [ "$(date +%u)" -eq 1 ]; then
+            WEEK_START=$(date +%Y-%m-%d)
+          fi
+          echo "week_start=$WEEK_START" >> $GITHUB_OUTPUT
+          echo "week_end=$WEEK_END" >> $GITHUB_OUTPUT
+          echo "date=$WEEK_END" >> $GITHUB_OUTPUT
+          echo "本周时间范围: $WEEK_START 至 $WEEK_END"
 
-      - name: Check if daily report already exists
+      - name: Check if weekly report already exists
         id: check_exists
         run: |
           DATE=${{ steps.date.outputs.date }}
-          if [ -f "daily/${DATE}.md" ]; then
-            echo "⚠️ 今日日报已存在: daily/${DATE}.md"
+          WEEK_FILE="weekly/${DATE}.md"
+          if [ -f "$WEEK_FILE" ]; then
+            echo "⚠️ 本周周报已存在: $WEEK_FILE"
             echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
@@ -49,8 +61,10 @@ jobs:
           FOLO_API: "https://api.follow.is/entries"
           # 多个订阅源ID，用逗号分隔
           LIST_IDS: ${{ vars.FOLO_LIST_IDS || '55984129917681716,41795937307751506,106709235749293065,41440449356332035,41461870197170196' }}
+          WEEK_START: ${{ steps.date.outputs.week_start }}
+          WEEK_END: ${{ steps.date.outputs.week_end }}
         run: |
-          echo "正在获取内容..."
+          echo "正在获取本周 ($WEEK_START 至 $WEEK_END) 的内容..."
           mkdir -p temp
 
           # 1. 从多个 Folo 订阅源获取内容（如果有 Cookie）
@@ -82,27 +96,37 @@ jobs:
             done
           fi
 
-          # 合并 Folo 数据
+          # 合并 Folo 数据并过滤本周内容
           if [ -n "$all_folo_data" ]; then
-            echo "$all_folo_data" | node -e '
+            echo "$all_folo_data" | WEEK_START="$WEEK_START" WEEK_END="$WEEK_END" node -e '
               const fs = require("fs");
               let stdin = "";
               process.stdin.on("data", chunk => stdin += chunk);
               process.stdin.on("end", () => {
                 const allData = { data: [] };
                 const responses = stdin.split("|||").filter(r => r.trim());
+                const weekStart = new Date(process.env.WEEK_START);
+                const weekEnd = new Date(process.env.WEEK_END);
+                weekEnd.setHours(23, 59, 59, 999);
+
                 responses.forEach(resp => {
                   try {
                     const json = JSON.parse(resp);
                     if (json.data && Array.isArray(json.data)) {
-                      allData.data.push(...json.data);
+                      // 过滤本周内容
+                      const weekData = json.data.filter(entry => {
+                        if (!entry.entries || !entry.entries.publishedAt) return false;
+                        const pubDate = new Date(entry.entries.publishedAt);
+                        return pubDate >= weekStart && pubDate <= weekEnd;
+                      });
+                      allData.data.push(...weekData);
                     }
                   } catch (e) {
                     console.log("跳过无效 JSON 响应");
                   }
                 });
                 fs.writeFileSync("temp/folo_response.json", JSON.stringify(allData));
-                console.log("合并了 " + allData.data.length + " 条 Folo 记录");
+                console.log("本周共收集 " + allData.data.length + " 条 Folo 记录");
               });
             '
           fi
@@ -133,29 +157,73 @@ jobs:
           echo "]" >> temp/hackernews.json
 
           # 合并内容并保存到文件（不输出到 GITHUB_OUTPUT）
-          node -e '
+          WEEK_START="$WEEK_START" WEEK_END="$WEEK_END" node -e '
             const fs = require("fs");
             let content = "";
+
+            // AI关键词列表（用于优先筛选）
+            const aiKeywords = [
+              "ai", "artificial intelligence", "人工智能", "机器学习", "machine learning",
+              "深度学习", "deep learning", "gpt", "chatgpt", "claude", "deepseek",
+              "llm", "大模型", "语言模型", "transformer", "neural", "神经网络",
+              "generative", "生成式", "diffusion", "stable diffusion", "midjourney",
+              "openai", "anthropic", "谷歌ai", "google ai", "gemini", "bard",
+              "copilot", "ai应用", "ai产品", "ai工具", "智能助手", "agent",
+              "rag", "prompt", "fine-tuning", "微调", "embedding",
+              "计算机视觉", "nlp", "自然语言处理", "语音识别", "自动驾驶",
+              "ai芯片", "gpu", "nvidia", "tpu", "算力", "gpu集群"
+            ];
+
+            function isAiRelated(title, description) {
+              const text = (title + " " + (description || "")).toLowerCase();
+              return aiKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+            }
 
             // Folo（优先显示，如果有数据）
             try {
               const folo = JSON.parse(fs.readFileSync("temp/folo_response.json", "utf8"));
               if (folo.data && folo.data.length > 0) {
-                // 按发布时间排序，取最新的
+                // 按发布时间排序
                 const sortedData = folo.data
                   .filter(entry => entry.entries && entry.entries.title)
                   .sort((a, b) => new Date(b.entries.publishedAt) - new Date(a.entries.publishedAt));
 
-                content += "\n## Folo 订阅精选\n\n";
-                sortedData.slice(0, 10).forEach((entry, i) => {
+                // 分离 AI 相关和非 AI 相关内容
+                const aiNews = [];
+                const otherNews = [];
+
+                sortedData.forEach(entry => {
+                  if (isAiRelated(entry.entries.title, entry.entries.description)) {
+                    aiNews.push(entry);
+                  } else {
+                    otherNews.push(entry);
+                  }
+                });
+
+                // AI 新闻放在前面
+                const prioritizedData = [...aiNews, ...otherNews];
+
+                content += `\n## 📰 Folo 订阅精选 (${process.env.WEEK_START} 至 ${process.env.WEEK_END})\n\n`;
+                content += `> 共收集 ${sortedData.length} 条资讯，其中 ${aiNews.length} 条 AI 相关内容\n\n`;
+
+                // 显示更多内容（周报）
+                prioritizedData.slice(0, 20).forEach((entry, i) => {
                   const title = entry.entries.title;
                   const url = entry.entries.url || "";
                   const author = entry.entries.author || entry.feeds?.title || "未知";
                   const publishedAt = entry.entries.publishedAt ? new Date(entry.entries.publishedAt).toLocaleDateString("zh-CN") : "";
-                  content += `### ${i + 1}. ${title}\n`;
+                  const isAi = i < aiNews.length;
+
+                  content += `### ${i + 1}. ${title}`;
+                  if (isAi) content += ` 🤖`;
+                  content += `\n`;
                   content += `**来源**: ${author}`;
                   if (publishedAt) content += ` | **日期**: ${publishedAt}`;
                   content += `\n`;
+                  if (entry.entries.description) {
+                    const desc = entry.entries.description.replace(/<[^>]*>/g, "").slice(0, 200);
+                    content += `**摘要**: ${desc}...\n`;
+                  }
                   if (url) content += `[阅读原文](${url})\n`;
                   content += "\n---\n";
                 });
@@ -219,23 +287,11 @@ jobs:
           echo "正在调用 AI 生成摘要..."
 
           CONTENT=$(cat temp/content.txt)
-
-          # 将内容写入临时文件用于 prompt
-          cat > temp/prompt.txt << 'PROMPT_EOF'
-          你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
-          1. 用通俗易懂的语言总结
-          2. 提炼每条资讯的核心要点
-          3. 保持专业但不失趣味性
-          4. 使用 Markdown 格式
-          5. 对核心关键词进行加粗处理
-
-          原始内容：
-          PROMPT_EOF
-          echo "$CONTENT" >> temp/prompt.txt
+          WEEK_START="${{ steps.date.outputs.week_start }}"
+          WEEK_END="${{ steps.date.outputs.week_end }}"
 
           # 调用 AI API (OpenAI 兼容格式)
-          # 使用文件来传递 JSON 避免 shell 转义问题
-          node -e '
+          WEEK_START="$WEEK_START" WEEK_END="$WEEK_END" node -e '
             const fs = require("fs");
             const content = fs.readFileSync("temp/content.txt", "utf8");
             const https = require("https");
@@ -244,25 +300,31 @@ jobs:
             const url = process.env.AI_API_URL;
             const apiKey = process.env.AI_API_KEY;
             const model = process.env.AI_MODEL || "glm-5";
+            const weekStart = process.env.WEEK_START;
+            const weekEnd = process.env.WEEK_END;
 
             const postData = JSON.stringify({
               model: model,
               messages: [
-                {role: "system", content: "你是一名专业的AI资讯编辑，擅长用通俗易懂的语言总结科技资讯。你特别关注人工智能、机器学习、大模型、深度学习等领域的最新动态。"},
-                {role: "user", content: `你是一名专业的AI资讯编辑。请根据以下内容生成一份AI日报摘要，要求：
-          1. 用通俗易懂的语言总结
-          2. 提炼每条资讯的核心要点
-          3. 保持专业但不失趣味性
-          4. 使用 Markdown 格式
-          5. 对核心关键词进行加粗处理
-          6. 【重要】优先展示AI相关内容（如：人工智能、机器学习、大模型、GPT、Claude、DeepSeek、AI应用、AI产品等），将AI新闻放在最前面
-          7. 如果有多篇新闻，按AI相关程度排序，AI含量高的内容优先展示
-          8. 非AI相关的科技新闻可以简要提及或放在最后
+                {role: "system", content: `你是一名专业的AI资讯编辑，擅长用通俗易懂的语言总结科技资讯。你特别关注人工智能、机器学习、大模型、深度学习等领域的最新动态。你需要生成一份每周AI资讯周报。`},
+                {role: "user", content: `你是一名专业的AI资讯编辑。请根据以下内容生成一份本周AI周报摘要，要求：
+1. 用通俗易懂的语言总结
+2. 提炼每条资讯的核心要点
+3. 保持专业但不失趣味性
+4. 使用 Markdown 格式，包含标题、摘要、分类等
+5. 对核心关键词进行加粗处理
+6. 【重要】优先展示AI相关内容（如：人工智能、机器学习、大模型、GPT、Claude、DeepSeek、AI应用、AI产品等）
+7. 按AI相关程度排序，AI含量高的内容优先展示，非AI内容可简要提及或省略
+8. 总结本周AI领域的重要趋势和动态
+9. 如果有多篇相似新闻，可以合并成一个主题
+10. 为周报起一个吸引人的标题
 
-          原始内容：
-          ${content}`}
+本周时间范围：${weekStart} 至 ${weekEnd}
+
+原始内容：
+${content}`}
               ],
-              max_tokens: 4000,
+              max_tokens: 6000,
               temperature: 0.7
             });
 
@@ -311,18 +373,21 @@ jobs:
             echo "summary_file=temp/summary.txt" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create daily markdown file
+      - name: Create weekly markdown file
         if: steps.ai.outputs.summary_file != ''
         run: |
-          echo "正在创建日报文件..."
+          echo "正在创建周报文件..."
 
-          mkdir -p daily
+          mkdir -p weekly
           DATE=${{ steps.date.outputs.date }}
+          WEEK_START=${{ steps.date.outputs.week_start }}
+          WEEK_END=${{ steps.date.outputs.week_end }}
           SUMMARY=$(cat temp/summary.txt)
 
-          cat > daily/${DATE}.md << EOF
-          # AI 洞察日报 - ${DATE}
+          cat > weekly/${DATE}.md << EOF
+          # AI 洞察周报
 
+          > 时间范围: ${WEEK_START} 至 ${WEEK_END}
           > 自动生成于 $(date "+%Y-%m-%d %H:%M:%S")
 
           ---
@@ -331,14 +396,16 @@ jobs:
 
           ---
 
-          *本日报由 GitHub Actions 自动生成*
+          *本周报由 GitHub Actions 自动生成*
           EOF
 
-          echo "日报文件已创建: daily/${DATE}.md"
+          echo "周报文件已创建: weekly/${DATE}.md"
 
       - name: Send to WPS IM Robot
         env:
           WPS_WEBHOOK_URL: ${{ secrets.WPS_WEBHOOK_URL }}
+          WEEK_START: ${{ steps.date.outputs.week_start }}
+          WEEK_END: ${{ steps.date.outputs.week_end }}
         run: |
           # 检查是否配置了 Webhook
           if [ -z "$WPS_WEBHOOK_URL" ]; then
@@ -347,41 +414,43 @@ jobs:
           fi
 
           DATE=${{ steps.date.outputs.date }}
-          DAILY_FILE="daily/${DATE}.md"
+          WEEKLY_FILE="weekly/${DATE}.md"
 
-          # 检查日报文件是否存在（新创建的或已存在的）
-          if [ ! -f "$DAILY_FILE" ]; then
-            echo "⚠️ 今日日报不存在，跳过推送"
+          # 检查周报文件是否存在（新创建的或已存在的）
+          if [ ! -f "$WEEKLY_FILE" ]; then
+            echo "⚠️ 本周周报不存在，跳过推送"
             exit 0
           fi
 
           echo "正在推送到 WPS 协作机器人..."
 
           # 使用 Node.js 发送请求，正确处理 JSON 编码
-          DATE=$DATE node -e '
+          DATE=$DATE WEEK_START="$WEEK_START" WEEK_END="$WEEK_END" node -e '
             const https = require("https");
             const http = require("http");
             const fs = require("fs");
 
             const webhookUrl = process.env.WPS_WEBHOOK_URL;
             const date = process.env.DATE;
-            const dailyFile = `daily/${date}.md`;
+            const weekStart = process.env.WEEK_START;
+            const weekEnd = process.env.WEEK_END;
+            const weeklyFile = `weekly/${date}.md`;
 
-            // 从日报文件读取内容
+            // 从周报文件读取内容
             let content = "";
             try {
-              content = fs.readFileSync(dailyFile, "utf8");
+              content = fs.readFileSync(weeklyFile, "utf8");
               // 截取前3500字符
               content = content.slice(0, 3500);
             } catch (e) {
-              console.error("读取日报文件失败:", e.message);
+              console.error("读取周报文件失败:", e.message);
               process.exit(1);
             }
 
             const postData = JSON.stringify({
               msgtype: "text",
               text: {
-                content: `📰 AI洞察日报 - ${date}\n\n${content}`
+                content: `📰 AI洞察周报 (${weekStart} 至 ${weekEnd})\n\n${content}`
               }
             });
 
@@ -404,7 +473,7 @@ jobs:
               res.on("data", chunk => data += chunk);
               res.on("end", () => {
                 if (res.statusCode === 200) {
-                  console.log("✅ 日报已成功推送到 WPS 协作机器人");
+                  console.log("✅ 周报已成功推送到 WPS 协作机器人");
                 } else {
                   console.log("❌ 推送失败，HTTP 状态码:", res.statusCode);
                   console.log("响应:", data);
@@ -425,15 +494,15 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          if [ -d "daily" ]; then
-            git add daily/
+          if [ -d "weekly" ]; then
+            git add weekly/
           fi
 
           if git diff --staged --quiet; then
             echo "没有文件变更，无需提交。"
           else
             echo "检测到文件变更，正在提交..."
-            git commit -m "docs: 自动生成日报 ${{ steps.date.outputs.date }}"
+            git commit -m "docs: 自动生成周报 ${{ steps.date.outputs.date }} (${{ steps.date.outputs.week_start }} 至 ${{ steps.date.outputs.week_end }})"
             git push
           fi
 
